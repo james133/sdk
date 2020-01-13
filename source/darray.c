@@ -53,6 +53,12 @@ void darray_free(struct darray_t* arr)
     arr->count = 0;
 }
 
+void darray_clear(struct darray_t* arr)
+{
+	assert(arr->count >= 0);
+	arr->count = 0;
+}
+
 int darray_erase(struct darray_t* arr, int index)
 {
     if (index < 0 || index >= arr->count)
@@ -63,17 +69,17 @@ int darray_erase(struct darray_t* arr, int index)
     return 0;
 }
 
-int darray_insert(struct darray_t* arr, int before, const void* items, int count)
+int darray_insert(struct darray_t* arr, int before, const void* item)
 {
 	int n;
     void* p;
 
-    if (!items || count < 1 || before < 0 || before > arr->count)
+    if (!item)
         return EINVAL;
 
-    if (arr->count + count > arr->capacity)
+    if (arr->count + 1 > arr->capacity)
     {
-		n = arr->count + count + (int)sqrt(arr->count);
+		n = arr->count + 1 + (int)sqrt(arr->count);
         p = arr->alloc(arr, n * arr->size);
         if (!p)
             return ENOMEM;
@@ -81,16 +87,13 @@ int darray_insert(struct darray_t* arr, int before, const void* items, int count
         arr->capacity = n;
     }
 
-	if(arr->count > before)
-		memmove(ADDRESS(before + count), ADDRESS(before), SIZE(arr->count - before));
-    memcpy(ADDRESS(before), items, SIZE(count));
-    arr->count += count;
+	if (before >= 0 && arr->count > before)
+		memmove(ADDRESS(before + 1), ADDRESS(before), SIZE(arr->count - before));
+	else
+		before = arr->count;
+    memcpy(ADDRESS(before), item, SIZE(1));
+    arr->count += 1;
     return 0;
-}
-
-int darray_push_back(struct darray_t* arr, const void* items, int count)
-{
-    return darray_insert(arr, arr->count, items, count);
 }
 
 int darray_pop_back(struct darray_t* arr)
@@ -121,10 +124,10 @@ void* darray_find(const struct darray_t* arr, const void* item, int *pos, darray
 	int i, r;
 	void* v;
 	pos = pos ? pos : &i;
-	for (*pos = 0; *pos < darray_count(arr); *pos++)
+	for (*pos = 0; *pos < darray_count(arr); *pos += 1)
 	{
 		v = darray_get((struct darray_t*)arr, *pos);
-		r = compare(v, item);
+		r = compare ? compare(v, item) : (0 == memcmp(v, item, arr->size) ? 0 : -1);
 		if (0 == r)
 			return v;
 		else if (r > 0)
@@ -139,7 +142,7 @@ int darray_insert2(struct darray_t* arr, const void* item, darray_compare compar
 	int pos;
 	if (NULL != darray_find(arr, item, &pos, compare))
 		return -1; // EEXIST
-	return darray_insert(arr, pos, &item, 1);
+	return darray_insert(arr, pos, item);
 }
 
 int darray_erase2(struct darray_t* arr, const void* item, darray_compare compare)

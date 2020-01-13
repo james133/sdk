@@ -2,6 +2,9 @@
 #define _sockutil_h_
 
 #include "sys/sock.h"
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <assert.h>
 
 #if defined(OS_WINDOWS)
@@ -44,6 +47,10 @@ static inline int socket_send_all_by_time(IN socket_t sock, IN const void* buf, 
 static inline int socket_recv_by_time(IN socket_t sock, OUT void* buf, IN size_t len, IN int flags, IN int timeout); // timeout: ms, <0-forever
 static inline int socket_recv_all_by_time(IN socket_t sock, OUT void* buf, IN size_t len, IN int flags, IN int timeout);  // timeout: ms, <0-forever
 static inline int socket_send_v_all_by_time(IN socket_t sock, IN socket_bufvec_t* vec, IN int n, IN int flags, IN int timeout); // timeout: ms, <0-forever
+
+/// @param[out] local ip destination addr(local address) without port
+static inline int socket_recvfrom_addr(IN socket_t sock, OUT socket_bufvec_t* vec, IN int n, IN int flags, OUT struct sockaddr* peer, OUT socklen_t* peerlen, OUT struct sockaddr* local, OUT socklen_t* locallen);
+static inline int socket_sendto_addr(IN socket_t sock, IN const socket_bufvec_t* vec, IN int n, IN int flags, IN const struct sockaddr* peer, IN socklen_t peerlen, IN const struct sockaddr* local, IN socklen_t locallen);
 
 //////////////////////////////////////////////////////////////////////////
 /// socket connect
@@ -119,9 +126,7 @@ static inline socket_t socket_connect_host(IN const char* ipv4_or_ipv6_or_dns, I
 static inline int socket_bind_any_ipv4(IN socket_t sock, IN u_short port)
 {
     struct sockaddr_in addr;
-    int domain;
-    socket_getdomain(sock, &domain);
-    memset(&addr, 0, sizeof(addr));
+	memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -164,6 +169,25 @@ static inline int socket_bind_any(IN socket_t sock, IN u_short port)
 //////////////////////////////////////////////////////////////////////////
 /// TCP/UDP server socket
 //////////////////////////////////////////////////////////////////////////
+
+/// TCP/UDP socket bind to address(IPv4/IPv6)
+/// @param[in] socktype SOCK_DGRAM/SOCK_STREAM
+static inline socket_t socket_bind_addr(const struct sockaddr* addr, int socktype)
+{
+	socket_t s;
+
+	s = socket(addr->sa_family, socktype, 0);
+	if (socket_invalid == s)
+		return socket_invalid;
+
+	if (0 != socket_bind(s, addr, socket_addr_len(addr)))
+	{
+		socket_close(s);
+		return socket_invalid;
+	}
+
+	return s;
+}
 
 /// create a new TCP socket, bind, and listen
 /// @param[in] ip socket bind local address, NULL-bind any address
@@ -268,13 +292,49 @@ static inline socket_t socket_tcp_listen_ipv6(IN const char* ipv4_or_ipv6_or_dns
 	return 0 == r ? sock : socket_invalid;
 }
 
+/// @param[in] reuse 1-enable reuse addr
+/// @param[in] dual 1-enable ipv6 dual stack
+/// @return socket_invalid-error, other-ok
+static inline socket_t socket_udp_bind_addr(IN const struct sockaddr* addr, int reuse, int dual)
+{
+	socket_t s;
+	
+	assert(AF_INET == addr->sa_family || AF_INET6 == addr->sa_family);
+	s = socket(addr->sa_family, SOCK_DGRAM, 0);
+	if (socket_invalid == s)
+		return socket_invalid;
+
+	// disable reuse addr(fixed rtp port reuse error)
+	if (reuse && 0 != socket_setreuseaddr(s, 1))
+	{
+		socket_close(s);
+		return socket_invalid;
+	}
+
+	// Dual-Stack Socket option
+	// https://msdn.microsoft.com/en-us/library/windows/desktop/bb513665(v=vs.85).aspx
+	// By default, an IPv6 socket created on Windows Vista and later only operates over the IPv6 protocol.
+	if (AF_INET6 == addr->sa_family && 0 != socket_setipv6only(s, dual ? 1 : 0))
+	{
+		socket_close(s);
+		return socket_invalid;
+	}
+
+	if (0 != socket_bind(s, addr, socket_addr_len(addr)))
+	{
+		socket_close(s);
+		return socket_invalid;
+	}
+
+	return s;
+}
+
 /// create a new UDP socket and bind with ip/port
 /// @param[in] ipv4_or_ipv6_or_dns socket bind local address, NULL-bind any address
 /// @param[in] port bind local port
 /// @return socket_invalid-error, use socket_geterror() to get error code, other-ok 
 static inline socket_t socket_udp_bind(IN const char* ipv4_or_ipv6_or_dns, IN u_short port)
 {
-	int r;
 	socket_t sock;
 	char portstr[16];
 	struct addrinfo hints, *addr, *ptr;
@@ -284,32 +344,22 @@ static inline socket_t socket_udp_bind(IN const char* ipv4_or_ipv6_or_dns, IN u_
 	hints.ai_socktype = SOCK_DGRAM;
 	hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
 	snprintf(portstr, sizeof(portstr), "%hu", port);
-	r = getaddrinfo(ipv4_or_ipv6_or_dns, portstr, &hints, &addr);
-	if (0 != r)
+	if (0 != getaddrinfo(ipv4_or_ipv6_or_dns, portstr, &hints, &addr))
 		return socket_invalid;
 
-	r = -1; // not found
     sock = socket_invalid;
-	for (ptr = addr; 0 != r && ptr != NULL; ptr = ptr->ai_next)
+	for (ptr = addr; socket_invalid == sock && ptr != NULL; ptr = ptr->ai_next)
 	{
 		assert(AF_INET == ptr->ai_family);
-		sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-		if (socket_invalid == sock)
-			continue;
-
-		// disable reuse addr(fixed rtp port reuse error)
-		//socket_setreuseaddr(sock, 1);
-
+		
 		// fixed ios getaddrinfo don't set port if nodename is ipv4 address
 		socket_addr_setport(ptr->ai_addr, ptr->ai_addrlen, port);
-
-		r = socket_bind(sock, ptr->ai_addr, ptr->ai_addrlen);
-		if (0 != r)
-			socket_close(sock);
+		
+		sock = socket_udp_bind_addr(ptr->ai_addr, 0, 0);
 	}
 
 	freeaddrinfo(addr);
-	return 0 == r ? sock : socket_invalid;
+	return sock;
 }
 
 /// create a new UDP socket and bind with ip/port
@@ -319,7 +369,6 @@ static inline socket_t socket_udp_bind(IN const char* ipv4_or_ipv6_or_dns, IN u_
 /// @return socket_invalid-error, use socket_geterror() to get error code, other-ok 
 static inline socket_t socket_udp_bind_ipv6(IN const char* ipv4_or_ipv6_or_dns, IN u_short port, IN int ipv4)
 {
-	int r;
 	socket_t sock;
 	char portstr[16];
 	struct addrinfo hints, *addr, *ptr;
@@ -329,38 +378,22 @@ static inline socket_t socket_udp_bind_ipv6(IN const char* ipv4_or_ipv6_or_dns, 
 	hints.ai_socktype = SOCK_DGRAM;
 	hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
 	snprintf(portstr, sizeof(portstr), "%hu", port);
-	r = getaddrinfo(ipv4_or_ipv6_or_dns, portstr, &hints, &addr);
-	if (0 != r)
+	if (0 != getaddrinfo(ipv4_or_ipv6_or_dns, portstr, &hints, &addr))
 		return socket_invalid;
 
-	r = -1; // not found
     sock = socket_invalid;
-	for (ptr = addr; 0 != r && ptr != NULL; ptr = ptr->ai_next)
+	for (ptr = addr; socket_invalid == sock && ptr != NULL; ptr = ptr->ai_next)
 	{
 		assert(AF_INET6 == ptr->ai_family);
-		sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-		if (socket_invalid == sock)
-			continue;
-
-		// Dual-Stack Socket option
-		// https://msdn.microsoft.com/en-us/library/windows/desktop/bb513665(v=vs.85).aspx
-		// By default, an IPv6 socket created on Windows Vista and later only operates over the IPv6 protocol.
-		if (0 != socket_setreuseaddr(sock, 1) || 0 != socket_setipv6only(sock, ipv4 ? 0 : 1))
-		{
-			socket_close(sock);
-			continue;
-		}
 
 		// fixed ios getaddrinfo don't set port if nodename is ipv4 address
 		socket_addr_setport(ptr->ai_addr, ptr->ai_addrlen, port);
 
-		r = socket_bind(sock, ptr->ai_addr, ptr->ai_addrlen);
-		if (0 != r)
-			socket_close(sock);
+		sock = socket_udp_bind_addr(ptr->ai_addr, 0, ipv4);
 	}
 
 	freeaddrinfo(addr);
-	return 0 == r ? sock : socket_invalid;
+	return sock;
 }
 
 /// wait for client connection
@@ -538,6 +571,308 @@ static inline int socket_sendto_v_by_time(IN socket_t sock, IN const socket_bufv
 
 	r = socket_sendto_v(sock, vec, n, flags, to, tolen);
 	return r;
+}
+
+#if defined(OS_WINDOWS) && _WIN32_WINNT >= 0x0600
+#include <Mswsock.h>
+static inline BOOL WINAPI wsarecvmsgcallback(PINIT_ONCE InitOnce, PVOID Parameter, PVOID *Parameter2)
+{
+	DWORD bytes;
+	socket_t sock;
+	GUID guid = WSAID_WSARECVMSG;
+	sock = socket_tcp();
+	WSAIoctl(sock, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(GUID), Parameter, sizeof(LPFN_WSARECVMSG), &bytes, NULL, NULL);
+	socket_close(sock);
+	(void)InitOnce, (void)Parameter2;
+	return TRUE;
+}
+#endif
+
+/// @param[out] local ip destination addr(local address) without port
+static inline int socket_recvfrom_addr(IN socket_t sock, OUT socket_bufvec_t* vec, IN int n, IN int flags, OUT struct sockaddr* peer, OUT socklen_t* peerlen, OUT struct sockaddr* local, OUT socklen_t* locallen)
+{
+	int r;
+	char control[64];
+	
+#if defined(OS_WINDOWS) && _WIN32_WINNT >= 0x0600
+	struct cmsghdr *cmsg;
+	struct in_pktinfo* pktinfo;
+	struct in6_pktinfo* pktinfo6;
+	static INIT_ONCE wsarecvmsgonce;
+	static LPFN_WSARECVMSG WSARecvMsg;
+
+	DWORD bytes;
+	WSAMSG wsamsg;
+	InitOnceExecuteOnce(&wsarecvmsgonce, wsarecvmsgcallback, &WSARecvMsg, NULL);
+	memset(control, 0, sizeof(control));
+	memset(&wsamsg, 0, sizeof(wsamsg));
+	wsamsg.name = peer;
+	wsamsg.namelen = *peerlen;
+	wsamsg.lpBuffers = vec;
+	wsamsg.dwBufferCount = n;
+	wsamsg.Control.buf = control;
+	wsamsg.Control.len = sizeof(control);
+	wsamsg.dwFlags = flags;
+	r = WSARecvMsg(sock, &wsamsg, &bytes, NULL, NULL);
+	if (0 != r)
+		return r;
+
+	*peerlen = wsamsg.namelen;
+	for (cmsg = CMSG_FIRSTHDR(&wsamsg); !!cmsg && local && locallen; cmsg = CMSG_NXTHDR(&wsamsg, cmsg))
+	{
+		if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO && *locallen >= sizeof(struct sockaddr_in))
+		{
+			pktinfo = (struct in_pktinfo*)WSA_CMSG_DATA(cmsg);
+			*locallen = sizeof(struct sockaddr_in);
+			memset(local, 0, sizeof(struct sockaddr_in));
+			((struct sockaddr_in*)local)->sin_family = AF_INET;
+			memcpy(&((struct sockaddr_in*)local)->sin_addr, &pktinfo->ipi_addr, sizeof(pktinfo->ipi_addr));
+			break;
+		}
+		else if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO && *locallen >= sizeof(struct sockaddr_in6))
+		{
+			pktinfo6 = (struct in6_pktinfo*)WSA_CMSG_DATA(cmsg);
+			*locallen = sizeof(struct sockaddr_in6);
+			memset(local, 0, sizeof(struct sockaddr_in6));
+			((struct sockaddr_in6*)local)->sin6_family = AF_INET6;
+			memcpy(&((struct sockaddr_in6*)local)->sin6_addr, &pktinfo6->ipi6_addr, sizeof(pktinfo6->ipi6_addr));
+			break;
+		}
+	}
+
+	return bytes;
+	
+#elif defined(OS_LINUX)
+	struct msghdr hdr;
+	struct cmsghdr *cmsg;
+	memset(&hdr, 0, sizeof(hdr));
+	memset(control, 0, sizeof(control));
+	hdr.msg_name = peer;
+	hdr.msg_namelen = *peerlen;
+	hdr.msg_iov = vec;
+	hdr.msg_iovlen = n;
+	hdr.msg_control = control;
+	hdr.msg_controllen = sizeof(control);
+	hdr.msg_flags = 0;
+	r = recvmsg(sock, &hdr, flags);
+	if (-1 == r)
+		return -1;
+
+	*peerlen = hdr.msg_namelen;
+	for (cmsg = CMSG_FIRSTHDR(&hdr); !!cmsg && local && locallen; cmsg = CMSG_NXTHDR(&hdr, cmsg))
+	{
+		if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO && *locallen >= sizeof(struct sockaddr_in))
+		{
+			struct in_pktinfo* pktinfo;
+			pktinfo = (struct in_pktinfo*)CMSG_DATA(cmsg);
+			*locallen = sizeof(struct sockaddr_in);
+			memset(local, 0, sizeof(struct sockaddr_in));
+			((struct sockaddr_in*)local)->sin_family = AF_INET;
+			memcpy(&((struct sockaddr_in*)local)->sin_addr, &pktinfo->ipi_addr, sizeof(pktinfo->ipi_addr));
+			break;
+		}
+#if defined(_GNU_SOURCE)
+		else if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO && *locallen >= sizeof(struct sockaddr_in6))
+		{
+			struct in6_pktinfo* pktinfo6;
+			pktinfo6 = (struct in6_pktinfo*)CMSG_DATA(cmsg);
+			*locallen = sizeof(struct sockaddr_in6);
+			memset(local, 0, sizeof(struct sockaddr_in6));
+			((struct sockaddr_in6*)local)->sin6_family = AF_INET6;
+			memcpy(&((struct sockaddr_in6*)local)->sin6_addr, &pktinfo6->ipi6_addr, sizeof(pktinfo6->ipi6_addr));
+			break;
+		}
+#endif
+	}
+
+	return r;
+#else
+#pragma error("xxxx\n");
+	return -1;
+#endif
+}
+
+static inline int socket_sendto_addr(IN socket_t sock, IN const socket_bufvec_t* vec, IN int n, IN int flags, IN const struct sockaddr* peer, IN socklen_t peerlen, IN const struct sockaddr* local, IN socklen_t locallen)
+{
+	char control[64];
+
+#if defined(OS_WINDOWS) && _WIN32_WINNT >= 0x0600
+	struct cmsghdr *cmsg;
+	struct in_pktinfo* pktinfo;
+	struct in6_pktinfo* pktinfo6;
+
+	DWORD bytes;
+	WSAMSG wsamsg;
+	wsamsg.name = (LPSOCKADDR)peer;
+	wsamsg.namelen = peerlen;
+	wsamsg.lpBuffers = (LPWSABUF)vec;
+	wsamsg.dwBufferCount = n;
+	wsamsg.Control.buf = control;
+	wsamsg.Control.len = sizeof(control);
+	wsamsg.dwFlags = 0;
+
+	cmsg = CMSG_FIRSTHDR(&wsamsg);
+	if (AF_INET == local->sa_family && locallen >= sizeof(struct sockaddr_in))
+	{
+		cmsg->cmsg_level = IPPROTO_IP;
+		cmsg->cmsg_type = IP_PKTINFO;
+		cmsg->cmsg_len = WSA_CMSG_LEN(sizeof(struct in_pktinfo));
+		pktinfo = (struct in_pktinfo*)WSA_CMSG_DATA(cmsg);
+		memset(pktinfo, 0, sizeof(struct in_pktinfo));
+		memcpy(&pktinfo->ipi_addr, &((struct sockaddr_in*)local)->sin_addr, sizeof(pktinfo->ipi_addr));
+		wsamsg.Control.len = CMSG_SPACE(sizeof(struct in_pktinfo));
+	}
+	else if (AF_INET6 == local->sa_family && locallen >= sizeof(struct sockaddr_in6))
+	{
+		cmsg->cmsg_level = IPPROTO_IPV6;
+		cmsg->cmsg_type = IPV6_PKTINFO;
+		cmsg->cmsg_len = WSA_CMSG_LEN(sizeof(struct in6_pktinfo));
+		pktinfo6 = (struct in6_pktinfo*)WSA_CMSG_DATA(cmsg);
+		memset(pktinfo6, 0, sizeof(struct in6_pktinfo));
+		memcpy(&pktinfo6->ipi6_addr, &((struct sockaddr_in6*)local)->sin6_addr, sizeof(pktinfo6->ipi6_addr));
+		wsamsg.Control.len = CMSG_SPACE(sizeof(struct in6_pktinfo));
+	}
+	else
+	{
+		assert(0);
+		return -1;
+	}
+
+	return 0 == WSASendMsg(sock, &wsamsg, flags, &bytes, NULL, NULL) ? bytes : SOCKET_ERROR;
+
+#elif defined(OS_LINUX)
+	struct msghdr hdr;
+	struct cmsghdr *cmsg;
+
+	memset(&hdr, 0, sizeof(hdr));
+	memset(control, 0, sizeof(control));
+	hdr.msg_name = &peer;
+	hdr.msg_namelen = peerlen;
+	hdr.msg_iov = (struct iovec*)vec;
+	hdr.msg_iovlen = n;
+	hdr.msg_control = control;
+	hdr.msg_controllen = sizeof(control);
+	hdr.msg_flags = 0;
+
+	cmsg = CMSG_FIRSTHDR(&hdr);
+	if (AF_INET == local->sa_family)
+	{
+		struct in_pktinfo* pktinfo;
+		cmsg->cmsg_level = SOL_IP;// IPPROTO_IP;
+		cmsg->cmsg_type = IP_PKTINFO;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+		pktinfo = (struct in_pktinfo*)CMSG_DATA(cmsg);
+		memset(pktinfo, 0, sizeof(struct in_pktinfo));
+		memcpy(&pktinfo->ipi_spec_dst, &((struct sockaddr_in*)local)->sin_addr, sizeof(pktinfo->ipi_spec_dst));
+		hdr.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+	}
+#if defined(_GNU_SOURCE)
+	else if (AF_INET6 == local->sa_family)
+	{
+		struct in6_pktinfo* pktinfo6;
+		cmsg->cmsg_level = IPPROTO_IPV6;
+		cmsg->cmsg_type = IPV6_PKTINFO;
+		cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+		pktinfo6 = (struct in6_pktinfo*)CMSG_DATA(cmsg);
+		memset(pktinfo6, 0, sizeof(struct in6_pktinfo));
+		memcpy(&pktinfo6->ipi6_addr, &((struct sockaddr_in6*)local)->sin6_addr, sizeof(pktinfo6->ipi6_addr));
+		hdr.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
+	}
+#endif
+	else
+	{
+		assert(0);
+		return -1;
+	}
+
+	return sendmsg(sock, &hdr, flags);
+#else
+#pragma error("xxxx\n");
+	return -1;
+#endif
+}
+
+/// @param[in] n total socket number, [1 ~ 64]
+/// @return <0-error, =0-timeout, >0-socket bitmask
+static inline int64_t socket_poll_read(socket_t s[], int n, int timeout)
+{
+	int i;
+	int64_t r;
+
+#if defined(OS_WINDOWS)
+	fd_set rfds;
+	fd_set wfds;
+	fd_set efds;
+	struct timeval tv;
+
+	assert(n <= 64);
+	FD_ZERO(&rfds);
+	FD_ZERO(&wfds);
+	FD_ZERO(&efds);
+	for (i = 0; i < n && i < 64; i++)
+	{
+		if(socket_invalid != s[i])
+			FD_SET(s[i], &rfds);
+	}
+
+	tv.tv_sec = timeout / 1000;
+	tv.tv_usec = (timeout % 1000) * 1000;
+	r = select(n, &rfds, &wfds, &efds, timeout < 0 ? NULL : &tv);
+	if (r <= 0)
+		return r;
+
+	for (r = i = 0; i < n && i < 64; i++)
+	{
+		if (socket_invalid == s[i])
+			continue;
+		if (FD_ISSET(s[i], &rfds))
+			r |= (int64_t)1 << i;
+	}
+
+	return r;
+#else
+	int j;
+	struct pollfd fds[64];
+	assert(n <= 64);
+	for (j = i = 0; i < n && i < 64; i++)
+	{
+		if (socket_invalid == s[i])
+			continue;
+		fds[j].fd = s[i];
+		fds[j].events = POLLIN;
+		fds[j].revents = 0;
+		j++;
+	}
+
+	r = poll(fds, j, timeout);
+	while (-1 == r && EINTR == errno)
+		r = poll(fds, j, timeout);
+
+	for (r = i = 0; i < n && i < 64; i++)
+	{
+		if (socket_invalid == s[i])
+			continue;
+		if (fds[i].revents & POLLIN)
+			r |= (int64_t)1 << i;
+	}
+
+	return r;
+#endif
+}
+
+static inline int64_t socket_poll_readv(int timeout, int n, ...)
+{
+	int i;
+	va_list args;
+	socket_t fd[64];
+
+	assert(n <= 64 && 64 <= FD_SETSIZE);
+	va_start(args, n);
+	for (i = 0; i < n && i < 64; i++)
+		fd[i] = va_arg(args, socket_t);
+	va_end(args);
+
+	return socket_poll_read(fd, n, timeout);
 }
 
 #if defined(_MSC_VER)

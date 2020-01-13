@@ -160,6 +160,8 @@ static inline int socket_setdontfrag(IN socket_t sock, IN int dontfrag); // ipv4
 static inline int socket_getdontfrag(IN socket_t sock, OUT int* dontfrag); // ipv4 udp only
 static inline int socket_setdontfrag6(IN socket_t sock, IN int dontfrag); // ipv6 udp only
 static inline int socket_getdontfrag6(IN socket_t sock, OUT int* dontfrag); // ipv6 udp only
+static inline int socket_setpktinfo(IN socket_t sock, IN int enable); // ipv4 udp only
+static inline int socket_setpktinfo6(IN socket_t sock, IN int enable); // ipv6 udp only
 
 // socket status
 // @return 0-ok, <0-socket_error(by socket_geterror())
@@ -402,8 +404,7 @@ static inline int socket_recvfrom_v(IN socket_t sock, IN socket_bufvec_t* vec, I
 {
 #if defined(OS_WINDOWS)
 	DWORD count = 0;
-	int r = WSARecvFrom(sock, vec, (DWORD)n, &count, (LPDWORD)&flags, from, fromlen, NULL, NULL);
-	return 0 == r ? (int)count : r;
+	return 0 == WSARecvFrom(sock, vec, (DWORD)n, &count, (LPDWORD)&flags, from, fromlen, NULL, NULL) ? (int)count : SOCKET_ERROR;
 #else
 	struct msghdr msg;
 	memset(&msg, 0, sizeof(msg));
@@ -448,7 +449,7 @@ static inline int socket_select_read(IN socket_t sock, IN int timeout)
 
 	tv.tv_sec = timeout/1000;
 	tv.tv_usec = (timeout%1000) * 1000;
-	return socket_select_readfds(sock+1, &fds, timeout<0?NULL:&tv);
+	return socket_select_readfds(0 /*sock+1*/, &fds, timeout<0?NULL:&tv);
 #else
 	int r;
 	struct pollfd fds;
@@ -477,7 +478,7 @@ static inline int socket_select_write(IN socket_t sock, IN int timeout)
 
 	tv.tv_sec = timeout/1000;
 	tv.tv_usec = (timeout%1000) * 1000;
-	return socket_select_writefds(sock+1, &fds, timeout<0?NULL:&tv);
+	return socket_select_writefds(0 /*sock+1*/, &fds, timeout<0?NULL:&tv);
 #else
 	int r;
 	struct pollfd fds;
@@ -519,7 +520,7 @@ static inline int socket_select_connect(IN socket_t sock, IN int timeout)
 	// MSDN > select function > Remarks:
 	//	writefds: If processing a connect call (nonblocking), connection has succeeded.
 	//	exceptfds: If processing a connect call (nonblocking), connection attempt failed.
-	r = socket_select(sock + 1, NULL, &wfds, &efds, timeout < 0 ? NULL : &tv);
+	r = socket_select(0 /*sock+1*/, NULL, &wfds, &efds, timeout < 0 ? NULL : &tv);
 	if (1 == r)
 	{
 		if (FD_ISSET(sock, &wfds))
@@ -900,6 +901,32 @@ static inline int socket_getdontfrag6(IN socket_t sock, OUT int* dontfrag)
 	return r;
 }
 
+// ipv4 udp only
+static inline int socket_setpktinfo(IN socket_t sock, IN int enable)
+{
+#if defined(OS_WINDOWS)
+	BOOL v = enable ? TRUE : FALSE;
+	return setsockopt(sock, IPPROTO_IP, IP_PKTINFO, (const char*)&v, sizeof(v));
+#elif defined(OS_LINUX)
+	return setsockopt(sock, IPPROTO_IP, IP_PKTINFO, &enable, sizeof(enable));
+#else
+	return -1;
+#endif
+}
+
+// ipv6 udp only
+static inline int socket_setpktinfo6(IN socket_t sock, IN int enable)
+{
+#if defined(OS_WINDOWS)
+	BOOL v = enable ? TRUE : FALSE;
+	return setsockopt(sock, IPPROTO_IPV6, IPV6_PKTINFO, (const char*)&v, sizeof(v));
+#elif defined(OS_LINUX)
+	return setsockopt(sock, IPPROTO_IPV6, IPV6_RECVPKTINFO, &enable, sizeof(enable));
+#else
+	return -1;
+#endif
+}
+
 static inline int socket_setttl(IN socket_t sock, IN int ttl)
 {
 	return setsockopt(sock, IPPROTO_IP, IP_TTL, (const char*)&ttl, sizeof(ttl));
@@ -1077,7 +1104,7 @@ static inline int socket_addr_from(OUT struct sockaddr_storage* ss, OUT socklen_
 	socket_addr_setport(addr->ai_addr, addr->ai_addrlen, port);
 	assert(addr->ai_addrlen <= sizeof(struct sockaddr_storage));
 	memcpy(ss, addr->ai_addr, addr->ai_addrlen);
-	*len = addr->ai_addrlen;
+	if(len) *len = addr->ai_addrlen;
 	freeaddrinfo(addr);
 	return 0;
 }
@@ -1089,14 +1116,14 @@ static inline int socket_addr_to(IN const struct sockaddr* sa, IN socklen_t sale
 		struct sockaddr_in* in = (struct sockaddr_in*)sa;
 		assert(sizeof(struct sockaddr_in) == salen);
 		inet_ntop(AF_INET, &in->sin_addr, ip, SOCKET_ADDRLEN);
-		*port = ntohs(in->sin_port);
+		if(port) *port = ntohs(in->sin_port);
 	}
 	else if (AF_INET6 == sa->sa_family)
 	{
 		struct sockaddr_in6* in6 = (struct sockaddr_in6*)sa;
 		assert(sizeof(struct sockaddr_in6) == salen);
 		inet_ntop(AF_INET6, &in6->sin6_addr, ip, SOCKET_ADDRLEN);
-		*port = ntohs(in6->sin6_port);
+		if (port) *port = ntohs(in6->sin6_port);
 	}
 	else
 	{
@@ -1163,10 +1190,18 @@ static inline int socket_addr_compare(const struct sockaddr* sa, const struct so
 	if(sa->sa_family != sb->sa_family)
 		return sa->sa_family - sb->sa_family;
 
+	// https://opensource.apple.com/source/postfix/postfix-197/postfix/src/util/sock_addr.c
 	switch (sa->sa_family)
 	{
-	case AF_INET:	return memcmp(sa, sb, sizeof(struct sockaddr_in));
-	case AF_INET6:	return memcmp(sa, sb, sizeof(struct sockaddr_in6));
+	case AF_INET:
+		return ((struct sockaddr_in*)sa)->sin_port==((struct sockaddr_in*)sb)->sin_port 
+			&& 0 == memcmp(&((struct sockaddr_in*)sa)->sin_addr, &((struct sockaddr_in*)sb)->sin_addr, sizeof(struct in_addr))
+			? 0 : -1;
+	case AF_INET6:
+		return ((struct sockaddr_in6*)sa)->sin6_port == ((struct sockaddr_in6*)sb)->sin6_port 
+			&& 0 == memcmp(&((struct sockaddr_in6*)sa)->sin6_addr, &((struct sockaddr_in6*)sb)->sin6_addr, sizeof(struct in6_addr))
+			? 0 : -1;
+
 #if defined(OS_LINUX) || defined(OS_MAC) // Windows build 17061
 	// https://blogs.msdn.microsoft.com/commandline/2017/12/19/af_unix-comes-to-windows/
 	case AF_UNIX:	return memcmp(sa, sb, sizeof(struct sockaddr_un));
@@ -1188,7 +1223,7 @@ static inline int socket_addr_len(const struct sockaddr* addr)
 #if defined(AF_NETLINK)
 	//case AF_NETLINK:return sizeof(struct sockaddr_nl);
 #endif
-	default: return -1;
+	default: return 0;
 	}
 }
 

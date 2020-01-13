@@ -1,69 +1,139 @@
 #ifndef _ice_internal_h_
 #define _ice_internal_h_
 
-#define STUN_PORT 3478 // both TCP and UDP, rfc3489 8.1 Binding Requests (p10)
+#include "stun-internal.h"
+#include "ice-agent.h"
+#include "sys/atomic.h"
+#include "sockutil.h"
+#include "darray.h"
+#include "list.h"
+#include <stdint.h>
+#include <assert.h>
 
-//rfc3489 8.2 Shared Secret Requests(p13)
-#define STUN_SHARED_SECRET_PERIOD (10*60*1000) // 10m
-#define STUN_SHARED_SECRET_EXPIRE (30*60*1000) // 30m
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#define MAX(x, y) ((x) > (y) ? (x) : (y))
 
-// 0ms, 100ms, 300ms, 700ms, 1500ms, 3100ms, 4700ms, 6300ms, and 7900ms ==> At 9500ms,
-#define STUN_TIMEOUT 9500
-#define STUN_RETRANSMISSION_INTERVAL_MIN 100 //ms
-#define STUN_RETRANSMISSION_INTERVAL_MAX 1600 // ms
+#define ICE_STREAM_MAX		8
+#define ICE_COMPONENT_MAX	4
+#define ICE_TIMER_INTERVAL	20
+#define ICE_BINDING_TIMEOUT	200
+
+// agent MUST limit the total number of connectivity checks the agent 
+// performs across all check lists to a specific value.
+// A default of 100 is RECOMMENDED.
+#define ICE_CANDIDATE_LIMIT 32
+
+#define ICE_ROLE_CONFLICT 487
 
 enum ice_checklist_state_t
 {
-	ICE_CHECKLIST_RUNNING = 1,
+	ICE_CHECKLIST_FROZEN = 0,
+	ICE_CHECKLIST_RUNNING,
 	ICE_CHECKLIST_COMPLETED,
 	ICE_CHECKLIST_FAILED,
 };
 
-// rfc3489 7. Message Overview(p8)
-#define STUN_MSG_BIND_REQUEST					0x0001
-#define STUN_MSG_BIND_RESPONSE					0x0101
-#define STUN_MSG_BIND_ERROR_RESPONSE			0x0111
-#define STUN_MSG_SHARED_SECRET_REQUEST			0x0002
-#define STUN_MSG_SHARED_SECRET_RESPONSE			0x0102
-#define STUN_MSG_SHARED_SECRET_ERROR_RESPONSE	0x0112
-
-enum stun_message_attribute_t
+enum ice_candidate_pair_state_t
 {
-	STUN_ATTR_MAPPED_ADDRESS = 1, // bind response only(ip + port)
-	STUN_ATTR_RESPONSE_ADDRESS, // optional
-	STUN_ATTR_CHANGE_REQUEST, // optional, bind request only
-	STUN_ATTR_SOURCE_ADDRESS,
-	STUN_ATTR_CHANGED_ADDRESS, // bind response 
-	STUN_ATTR_USERNAME, // shared secret response/bind request
-	STUN_ATTR_PASSWORD, // shared secret response only
-	STUN_ATTR_MESSAGE_INTEGRITY, // bind request/response, MUST be the last attribute within a message.
-	STUN_ATTR_ERROR_CODE, // bind error response/shared secret error response
-	STUN_ATTR_UNKNOWN_ATTRIBUTES, // bind error response/shared secret error response
-	STUN_ATTR_REFLECTED_FROM, // bind response
-
-	STUN_ATTR_END = 0x7fff,
+	ICE_CANDIDATE_PAIR_FROZEN,
+	ICE_CANDIDATE_PAIR_WAITING,
+	ICE_CANDIDATE_PAIR_INPROGRESS,
+	ICE_CANDIDATE_PAIR_SUCCEEDED,
+	ICE_CANDIDATE_PAIR_FAILED,
 };
 
-// rfc 3489 11.1 Message Header (p25)
-struct stun_header_t
+enum ice_nomination_t
 {
-	uint16_t msgtype;
-	uint16_t length; // payload length, don't include header
-	uint8_t transaction_id[16];
-}
-
-#define STUN_ERROR_CODE_BAD_REQUEST 400
-#define STUN_ERROR_CODE_UNAUTHORIZED 401
-#define STUN_ERROR_CODE_UNKNOWN_ATTRIBUTE 420
-#define STUN_ERROR_CODE_STALE_CREDENTIALS 430
-#define STUN_ERROR_CODE_INTEGRITY_CHECK_FAILURE 431
-#define STUN_ERROR_CODE_MISSING_USERNAME 432
-#define STUN_ERROR_CODE_USE_TLS 433
-#define STUN_ERROR_CODE_SERVER_ERROR 500
-#define STUN_ERROR_CODE_GLOBAL_FAILURE 600
+	ICE_REGULAR_NOMINATION = 0,
+	ICE_AGGRESSIVE_NOMINATION,
+};
 
 // rounded-time is the current time modulo 20 minutes
 // USERNAME = <prefix,rounded-time,clientIP,hmac>
 // password = <hmac(USERNAME,anotherprivatekey)>
+
+struct ice_stream_t;
+struct ice_candidate_pair_t
+{
+	struct ice_candidate_t local;
+	struct ice_candidate_t remote;
+	enum ice_candidate_pair_state_t state;
+	int nominated; // use-candidate
+
+	uint64_t priority;
+	char foundation[66];
+	struct ice_stream_t* stream;
+};
+
+typedef struct darray_t ice_candidates_t;
+typedef struct darray_t ice_candidate_pairs_t;
+
+struct ice_stream_t
+{
+	struct list_head link;
+	int stream; // stream id
+	int status;
+
+	ice_candidates_t locals;
+	ice_candidates_t remotes;
+	struct ice_checklist_t* checklist;
+	struct stun_credential_t rauth; // remote auth
+
+	// nominated candidates(for each component)
+	struct ice_candidate_pair_t components[ICE_COMPONENT_MAX];
+	int ncomponent;
+};
+
+struct ice_agent_t
+{
+	//locker_t locker;
+
+	stun_agent_t* stun;
+	struct list_head streams;
+	enum ice_nomination_t nomination;
+	uint64_t tiebreaking; // role conflicts(network byte-order)
+	int controlling;
+
+	struct sockaddr_storage saddr; // stun/turn server addr
+	struct stun_credential_t auth; // local auth
+	struct stun_credential_t sauth; // stun/turn auth
+	struct ice_agent_handler_t handler;
+	void* param;
+};
+
+// RFC5245 5.7.2. Computing Pair Priority and Ordering Pairs
+// pair priority = 2^32*MIN(G,D) + 2*MAX(G,D) + (G>D?1:0)
+static inline void ice_candidate_pair_priority(struct ice_candidate_pair_t* pair, int controlling)
+{
+	uint32_t G, D;
+	G = controlling ? pair->local.priority : pair->remote.priority;
+	D = controlling ? pair->remote.priority : pair->local.priority;
+	pair->priority = ((uint64_t)1 << 32) * MIN(G, D) + 2 * MAX(G, D) + (G > D ? 1 : 0);
+}
+
+static inline void ice_candidate_pair_foundation(struct ice_candidate_pair_t* pair)
+{
+	snprintf(pair->foundation, sizeof(pair->foundation), "%s\n%s", pair->local.foundation, pair->remote.foundation);
+}
+
+/// ICE foundation update
+void ice_candidate_foundation(struct ice_agent_t* ice, struct ice_candidate_t* c);
+
+int ice_agent_bind(struct ice_agent_t* ice, const struct stun_credential_t* auth, const struct sockaddr* local, const struct sockaddr* remote, const struct sockaddr* relay, int timeout, stun_request_handler handler, void* param);
+int ice_agent_allocate(struct ice_agent_t* ice, const struct stun_credential_t* auth, const struct sockaddr* local, const struct sockaddr* remote, const struct sockaddr* relay, int timeout, stun_request_handler handler, void* param);
+int ice_agent_refresh(struct ice_agent_t* ice, const struct stun_credential_t* auth, const struct sockaddr* local, const struct sockaddr* remote, const struct sockaddr* relay, int timeout, stun_request_handler handler, void* param);
+int ice_agent_create_permission(struct ice_agent_t* ice, const struct stun_credential_t* auth, const struct sockaddr* local, const struct sockaddr* turn, const struct sockaddr* peer, int timeout, stun_request_handler handler, void* param);
+int ice_agent_channel_bind(struct ice_agent_t* ice, const struct stun_credential_t* auth, const struct sockaddr* local, const struct sockaddr* turn, const struct sockaddr* peer, uint16_t channel, int timeout, stun_request_handler handler, void* param);
+int ice_agent_connect(struct ice_agent_t* ice, const struct ice_candidate_pair_t* pr, int nominated, int timeout, stun_request_handler handler, void* param);
+
+int ice_stream_destroy(struct ice_stream_t** pp);
+int ice_agent_active_checklist_count(struct ice_agent_t* ice);
+struct ice_stream_t* ice_agent_find_stream(struct ice_agent_t* ice, int stream);
+struct ice_candidate_t* ice_agent_find_local_candidate(struct ice_agent_t* ice, const struct sockaddr_storage* host);
+struct ice_candidate_t* ice_agent_find_remote_candidate(struct ice_agent_t* ice, const struct sockaddr_storage* addr);
+
+int ice_agent_onrolechanged(void* param);
+int ice_agent_add_peer_reflexive_candidate(struct ice_agent_t* ice, const struct stun_address_t* addr, const struct stun_attr_t* priority);
+int ice_agent_add_remote_peer_reflexive_candidate(struct ice_agent_t* ice, uint8_t stream, uint16_t component, const struct stun_address_t* addr, const struct stun_attr_t* priority);
 
 #endif /* !_ice_internal_h_ */
